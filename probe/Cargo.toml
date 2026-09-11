@@ -1,0 +1,12 @@
+[package]
+name = "soroban-probe"
+description = "API-surface probe for wasmparser 0.245 used by soroban-analyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+wasmparser = { workspace = true }
+wat = { workspace = true }

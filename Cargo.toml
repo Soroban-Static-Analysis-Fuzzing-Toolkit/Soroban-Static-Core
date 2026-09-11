@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["analyzer", "common", "probe"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+wasmparser = { version = "0.245", default-features = false, features = ["std", "features", "validate"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+clap = { version = "4.5", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive"] }
+wat = "1"
+anyhow = "1.0"
+rayon = "1.10"
+thiserror = "2"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
