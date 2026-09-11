@@ -1,9 +1,21 @@
 //! Rust source front-end: lightweight heuristic scanner used in `src` mode.
 //!
-//! This is deliberately not a full rustc HIR/MIR pipeline — it is a fast,
-//! dependency-free scanner that recognizes Soroban SDK idioms (storage
-//! literals, `require_auth`, token transfers, loops) well enough to feed the
-//! source-mode detectors. Full HIR/MIR analysis can be layered on later.
+//! This is deliberately not a full `rustc` HIR/MIR pipeline. It is a fast,
+//! dependency-free heuristic scanner that recognizes common Soroban SDK idioms
+//! (storage literals, `require_auth`, token transfers, loops, TTL bumps) well
+//! enough to feed the source-mode detectors.
+//!
+//! Important limitations:
+//! - It works line-by-line over cleaned source text, so it can miss patterns
+//!   that depend on type information, macros, or non-trivial control flow.
+//! - It is conservative by design: when a heuristic cannot be sure, it prefers
+//!   a lower severity or no finding over a false positive.
+//! - The cleaning pass replaces comment bodies and string/char literal contents
+//!   with spaces, but extremely nested or malformed input can still surprise it.
+//!   The scanner therefore ships adversarial-line smoke tests and must never
+//!   panic on untrusted source.
+//!
+//! Full HIR/MIR analysis can be layered on later.
 
 use std::path::{Path, PathBuf};
 

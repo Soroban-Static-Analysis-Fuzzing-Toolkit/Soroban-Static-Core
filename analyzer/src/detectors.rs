@@ -254,6 +254,18 @@ fn sor_101_missing_require_auth(ir: &ModuleIr, rule: &RuleMeta, file: &str) -> V
 /// Computed with one reverse-reachability sweep instead of a fresh DFS per
 /// function, so a module with `n` functions and `e` call edges costs O(n + e)
 /// rather than O(n²).
+/// For every function, whether it transitively reaches an import whose name
+/// contains any of `needles`.
+///
+/// Computed with one reverse-reachability sweep instead of a fresh DFS per
+/// function, so a module with `n` functions and `e` call edges costs O(n + e)
+/// rather than O(n²).
+///
+/// Semantics: a function "reaches" a host import if it calls it directly or
+/// transitively through non-import helper functions. Imported functions are
+/// excluded from the caller graph because they have no body and cannot delegate
+/// further. Call targets outside the function table are ignored rather than
+/// treated as a reachability hit.
 fn reachable_imports(ir: &ModuleIr, needles: &[&str]) -> Vec<bool> {
     let n = ir.funcs.len();
     // Reverse call edges: callers[t] lists the functions that call t.
@@ -380,8 +392,15 @@ const READ_HOST_FNS: &[&str] = &["get_contract_data", "has_contract_data"];
 /// Host imports that perform ledger writes.
 const WRITE_HOST_FNS: &[&str] = &["put_contract_data", "del_contract_data"];
 
-/// How many helper-call layers the budget counters inline. Kept shallow on
-/// purpose: deeper inlining would multiply counts we cannot bound statically.
+/// How many helper-call layers the host-call counters inline.
+///
+/// Counters use call-site counting, not call-graph reachability: a helper
+/// invoked from an unbounded loop does **not** multiply a count we cannot bound
+/// statically. Inlining more than one layer would still multiply counts we
+/// cannot bound (transitively), so the default is intentionally shallow.
+///
+/// If you change this, re-run the budget and SOR-105 tests, because both the
+/// estimator and the read-count detector rely on the same counter.
 const HOST_INLINE_LEVELS: u32 = 1;
 
 fn sor_105_read_count_estimate(ir: &ModuleIr, rule: &RuleMeta, file: &str) -> Vec<Finding> {
@@ -397,7 +416,13 @@ fn sor_105_read_count_estimate(ir: &ModuleIr, rule: &RuleMeta, file: &str) -> Ve
             continue;
         }
         // Loops multiply: without knowing trip counts, assume 2x for
-        // functions with backedges (documented heuristic).
+        // functions with loop backedges (documented heuristic).
+        //
+        // This is a conservative guard for the read-count detector, not a
+        // measurement. It is intentionally simple so that the behavior is easy
+        // to reason about and to test; if you change it, update the
+        // `sor_101_accepts_auth_delegated_to_a_helper`-style regression coverage
+        // conceptually and re-run the detector tests.
         let estimate = if f.loop_backedges > 0 { base * 2 } else { base };
         let pct = estimate * 100 / limits.max_reads.max(1);
         if estimate >= limits.max_reads {
@@ -463,6 +488,17 @@ pub fn count_writes_for_budget(ir: &ModuleIr, idx: usize) -> u64 {
 /// This is call-site counting, not call-graph reachability: a helper invoked
 /// from an unbounded loop should not multiply a count we cannot bound
 /// statically.
+/// Count call sites in `idx` that reach a host import matching `needles`,
+/// inlining up to `levels` layers of helper calls.
+///
+/// This is call-site counting, not call-graph reachability: each direct call
+/// site in `idx` that (transitively) reaches a matching host import is counted
+/// once per site. A helper invoked from an unbounded loop therefore does **not**
+/// multiply a count we cannot bound statically.
+///
+/// Imported functions are leaf nodes: they either match (and are counted) or
+/// they do not. Defined helpers are recursed into only while `levels > 0`.
+/// Call targets outside the function table are ignored.
 fn count_host_calls(ir: &ModuleIr, idx: usize, needles: &[&str], levels: u32) -> u64 {
     let Some(f) = ir.funcs.get(idx) else {
         return 0;
@@ -497,6 +533,9 @@ fn sor_106_unbounded_memory(ir: &ModuleIr, rule: &RuleMeta, file: &str) -> Vec<F
         if f.import.is_some() {
             continue;
         }
+        // Both conditions are required: the issue is unbounded growth, not a
+        // single grow site, and not every loop contains a grow. This is a
+        // heuristic pattern match on the static IR, not a data-flow proof.
         if f.memory_grow_sites > 0 && f.loop_backedges > 0 {
             out.push(Finding {
                 rule_id: rule.id.to_string(),
@@ -604,6 +643,15 @@ fn sor_103_unchecked_arith(facts: &SourceFacts, rule: &RuleMeta) -> Vec<Finding>
 }
 
 /// Check SOR-104: unbounded loops over storage.
+///
+/// Heuristic: flag a loop if the scanner could not resolve a static range end
+/// **and** the enclosing function touches storage. If the range end is a
+/// literal, or if it looks like a reference to a locally-constructed iterator,
+/// the loop is treated as bounded for now. Everything else is unresolved.
+///
+/// This is intentionally coarse. It exists to catch the common
+/// "iterate over a caller-supplied collection while touching storage" pattern
+/// without requiring type information.
 fn sor_104_unbounded_loop(facts: &SourceFacts, rule: &RuleMeta) -> Vec<Finding> {
     let mut out = Vec::new();
     for f in &facts.functions {
@@ -649,6 +697,9 @@ fn sor_104_unbounded_loop(facts: &SourceFacts, rule: &RuleMeta) -> Vec<Finding> 
 }
 
 /// Whether a range-end hint looks statically bounded.
+///
+/// This is a heuristic, not a proof: uppercase constants and numeric literals
+/// are treated as bounded, and everything else is unresolved.
 fn is_static_bound(hint: &str) -> bool {
     let h = hint.trim();
     h.parse::<u64>().is_ok()

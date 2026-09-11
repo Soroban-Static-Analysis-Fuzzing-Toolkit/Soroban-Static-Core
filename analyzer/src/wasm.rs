@@ -252,6 +252,20 @@ fn record_func_import(
 /// call graphs cannot blow the stack): a function is recursive when it is in an
 /// SCC of more than one node, or calls itself directly. This is O(n + e),
 /// replacing a per-function DFS that was O(n²).
+/// Mark functions that participate in a call cycle.
+///
+/// Uses Tarjan's strongly-connected-components algorithm (iteratively, so deep
+/// call graphs cannot blow the stack): a function is recursive when it is in an
+/// SCC of more than one node, or calls itself directly. This is O(n + e),
+/// replacing a per-function DFS that was O(n²).
+///
+/// The implementation uses an explicit work stack of `(node, next child`,
+/// plus per-node visitation state. The `expect("non-empty")` and
+/// `expect("visited")` invariants are guaranteed by the algorithm and the
+/// pre-condition that every child index in `calls[v]` is either in-bounds or
+/// skipped. Out-of-bounds children are skipped earlier in the loop, so the
+/// only remaining `expect` sites are structural invariant checks for the
+/// explicit stack and the SCC stack.
 fn mark_recursion(ir: &mut ModuleIr) {
     let n = ir.funcs.len();
     let calls: Vec<Vec<u32>> = ir.funcs.iter().map(|f| f.calls.clone()).collect();
@@ -330,6 +344,11 @@ fn mark_recursion(ir: &mut ModuleIr) {
 fn compute_loop_costs(wasm: &[u8], ir: &mut ModuleIr) -> Result<()> {
     let mut per_fn_loop_ops: Vec<Vec<u64>> = Vec::new();
     let mut per_fn_loops: Vec<Vec<(u32, u32)>> = Vec::new(); // (header depth, backedges)
+    // Per-function vectors are indexed by defined-function ordinal. They are
+    // populated in the same streaming pass that visits `CodeSectionEntry`
+    // payloads, so their length must match `num_defined_funcs` at the end of
+    // the pass. The second pass below indexes them with
+    // `i - num_imported_funcs`, which is safe only for defined functions.
 
     for payload in Parser::new(0).parse_all(wasm) {
         if let Payload::CodeSectionEntry(body) = payload? {
@@ -374,8 +393,11 @@ fn compute_loop_costs(wasm: &[u8], ir: &mut ModuleIr) -> Result<()> {
         }
     }
 
-    // `per_fn_*` vectors are indexed by defined-function ordinal, while
-    // `ir.funcs` is the full function index space (imports come first).
+    // `per_fn_*` vectors are indexed by defined-function ordinal. They are
+    // populated in the same streaming pass that visits `CodeSectionEntry`
+    // payloads, so their length must match `num_defined_funcs` at the end of
+    // the pass. The second pass below indexes them with
+    // `i - num_imported_funcs`, which is safe only for defined functions.
     let imported = ir.num_imported_funcs as usize;
     for (i, f) in ir.funcs.iter_mut().enumerate() {
         if f.import.is_some() {

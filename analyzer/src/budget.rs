@@ -150,6 +150,18 @@ pub fn budget_module(
 ///
 /// Recursion and mutual recursion make exact totals impossible statically; the
 /// guard bounds the estimate instead of diverging.
+/// Hard cap on call-graph depth for instruction estimation.
+///
+/// Recursion and mutual recursion make exact totals impossible statically, so
+/// the estimator truncates after this many callee frames and charges the target
+/// function's body cost in place of the rest of the chain. This bounds the
+/// estimate instead of diverging, and prevents one entrypoint's deep traversal
+/// from leaking into another's memo table.
+///
+/// Chosen to be deeper than any realistic Soroban entrypoint call chain while
+/// still keeping the per-entrypoint memo reset cheap. If you change this,
+/// re-run the `entrypoint_estimates_do_not_depend_on_each_other` and
+/// `budgets_are_repeatable` tests.
 const MAX_CALL_DEPTH: usize = 16;
 
 /// Per-function instruction estimate with cycle-safe, depth-keyed memoization.

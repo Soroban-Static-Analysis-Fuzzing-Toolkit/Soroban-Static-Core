@@ -104,15 +104,53 @@ findings appear in the pull-request "Security" tab:
     sarif_file: results.sarif
 ```
 
-## Notes on precision
+## Scope and precision
 
-Wasm instruction counts are static estimates (`n_ops × coefficients`), summed
-over the call graph. Loop trip counts are unknowable statically, so the
-per-iteration cost is reported separately rather than folded into the total.
-Budget numbers answer "will a typical call fit?" — they are not consensus
-values. Verdicts are computed against the caps in
-[`common/src/limits.rs`](common/src/limits.rs) (reads, writes, memory pages,
-code size and CPU instructions), warning from 70% of any cap upward.
+### Wasm mode
+
+Wasm analysis parses and validates the binary with `wasmparser`, then runs a
+small static IR through the detector and budget engines. Instruction and I/O
+counts are **static estimates** (`n_ops × coefficients`, plus one level of
+helper inlining for host calls), summed over the call graph. Loop trip counts
+are unknowable statically, so the per-iteration cost is reported separately
+rather than folded into the total. Budget numbers answer "will a typical call
+fit?" — they are not consensus values. Verdicts are computed against the caps
+in [`common/src/limits.rs`](common/src/limits.rs) (reads, writes, memory
+pages, code size and CPU instructions), warning from 70% of any cap upward.
+
+Wasm mode does **not** model storage types, value types, or amount semantics.
+Rules that depend on that information ("SOR-102", "SOR-103", "SOR-104") are
+source-only for now.
+
+### Source mode
+
+Source analysis is a **lightweight heuristic scanner**, not a full `rustc`
+HIR/MIR pipeline. It recognizes common Soroban SDK idioms (storage literals,
+`require_auth`, token transfers, loops, TTL bumps) well enough to feed the
+source-mode detectors, and it is deliberately conservative: when a heuristic
+cannot be sure, it prefers a lower severity or no finding.
+
+Because it works line-by-line over cleaned source text, it can miss patterns
+that depend on type information, macros, or non-trivial control flow, and it
+can occasionally match idioms inside comments or string literals if the
+cleaning pass is surprised. The scanner includes fuzz-style adversarial-line
+smoke tests to keep the lexer from panicking, but it is not a substitute for
+proper semantic analysis.
+
+### Shared caveats
+
+- Host-call counting inlines only one helper layer by default. Deeper inlining
+  would multiply counts the analyzer cannot bound statically.
+- Recursion and mutual recursion make exact instruction totals impossible
+  statically, so the budget estimator truncates deep call chains and reports
+  the recursion flag separately.
+- Loop cost uses a documented heuristic: functions with loop backedges are
+  assumed to multiply their host-read estimate by 2 for the read-count
+  detector. This is a conservative guard, not a measurement.
+- Rule metadata says "both" only when a check exists for that mode. The
+  `every_registered_rule_is_wired` test fails when the registration and the
+  dispatch tables get out of sync, so a rule can no longer be registered but
+  never run.
 
 ## Contributing
 
