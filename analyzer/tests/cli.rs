@@ -49,6 +49,7 @@ fn analyzes_source_directory() {
         .arg(fixture("source"))
         .assert()
         .code(1)
+        .stdout(predicate::str::contains("SOR-101"))
         .stdout(predicate::str::contains("SOR-103"))
         .stdout(predicate::str::contains("SOR-104"));
 }

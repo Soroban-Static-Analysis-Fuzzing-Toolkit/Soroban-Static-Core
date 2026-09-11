@@ -54,7 +54,7 @@ every `.wasm`/`.wat` file it contains.
 
 | Id | Severity | Kind | Detects |
 | --- | --- | --- | --- |
-| `SOR-101` | error | wasm | State-changing entrypoint that never calls `require_auth`. |
+| `SOR-101` | error | both | Entrypoint that performs state-changing operations without `require_auth`. |
 | `SOR-102` | error | both | Storage-type confusion (e.g. per-item data in instance storage). |
 | `SOR-103` | error | both | Token amounts flowing into unchecked arithmetic. |
 | `SOR-104` | error | both | Loops over storage-derived data without a static bound. |

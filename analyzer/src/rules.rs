@@ -3,6 +3,7 @@
 //! Detector rules are configured per-id in a `soroban-analyzer.toml` file:
 //!
 //! ```toml
+//! # Both wasm and source modes are supported.
 //! [rules.SOR-101]
 //! enabled = true
 //! severity = "error"

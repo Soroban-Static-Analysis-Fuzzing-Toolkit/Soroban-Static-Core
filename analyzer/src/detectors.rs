@@ -40,9 +40,9 @@ pub fn all_rules() -> Vec<RuleMeta> {
         RuleMeta {
             id: "SOR-101",
             name: "missing-require-auth",
-            description: "Exported contract entrypoint performs state-changing host calls without requiring auth",
+            description: "Contract entrypoint performs state-changing operations without requiring auth",
             default_severity: Severity::Error,
-            kind: RuleKind::Wasm,
+            kind: RuleKind::Both,
         },
         RuleMeta {
             id: "SOR-102",
@@ -115,6 +115,7 @@ pub fn run_source_detectors(
         }
         let findings = match rule.kind {
             RuleKind::Source | RuleKind::Both => match rule.id {
+                "SOR-101" => sor_101_missing_require_auth_source(facts, &rule),
                 "SOR-102" => sor_102_storage_confusion(facts, &rule),
                 "SOR-103" => sor_103_unchecked_arith(facts, &rule),
                 "SOR-104" => sor_104_unbounded_loop(facts, &rule),
@@ -220,6 +221,79 @@ fn reaches_host_state_change(ir: &ModuleIr, idx: usize) -> bool {
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// SOR-101 (source mode): missing require_auth in Rust source
+
+/// Source-mode counterpart of SOR-101. Flags contract functions that perform
+/// state-changing operations (storage writes, TTL bumps, token transfers)
+/// without calling require_auth.
+fn sor_101_missing_require_auth_source(facts: &SourceFacts, rule: &RuleMeta) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for f in &facts.functions {
+        // Skip functions that already call require_auth.
+        if f.has_require_auth {
+            continue;
+        }
+        // Determine if this function performs state-changing operations.
+        let mut state_changing = false;
+        let mut change_description = String::new();
+
+        // Storage writes: .set() calls on Persistent, Temporary, or Instance.
+        for lit in &f.storage_literals {
+            if lit.spec == "Persistent" || lit.spec == "Temporary" || lit.spec == "Instance" {
+                state_changing = true;
+                if !change_description.is_empty() {
+                    change_description.push(';');
+                }
+                change_description.push_str(&format!(" {} storage write", lit.spec.to_lowercase()));
+            }
+        }
+
+        // TTL bumps extend contract data lifetime (state-changing).
+        if !f.ttl_bump_lines.is_empty() {
+            state_changing = true;
+            if !change_description.is_empty() {
+                change_description.push(';');
+            }
+            change_description.push_str(" TTL extension");
+        }
+
+        // Token transfers change account balances.
+        let does_transfer = f.calls.iter().any(|c| {
+            let c = c.as_str();
+            c == "transfer" || c.ends_with("::transfer") || c.ends_with("transfer(")
+        });
+        if does_transfer {
+            state_changing = true;
+            if !change_description.is_empty() {
+                change_description.push(';');
+            }
+            change_description.push_str(" token transfer");
+        }
+
+        if state_changing {
+            out.push(Finding {
+                rule_id: rule.id.to_string(),
+                message: format!(
+                    "function `{}` performs{change_description} but never calls require_auth",
+                    f.name
+                ),
+                help: Some(
+                    "add env.require_auth() for each account/contract authorized to perform this action".into(),
+                ),
+                severity: rule.default_severity,
+                location: Location {
+                    file: f.file.clone(),
+                    function: Some(f.name.clone()),
+                    offset: None,
+                    line: None,
+                },
+            });
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
