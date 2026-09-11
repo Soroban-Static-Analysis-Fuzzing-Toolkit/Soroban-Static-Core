@@ -47,8 +47,7 @@ pub fn analyze_module(
     cfg: &RulesConfig,
     limits: NetworkLimits,
 ) -> Result<AnalysisOutput> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     // Accept WAT for convenience (tests, tiny examples).
     let wasm: Vec<u8> = if path.extension().map(|e| e == "wat").unwrap_or(false) {
         wat::parse_bytes(&bytes)
@@ -62,7 +61,9 @@ pub fn analyze_module(
 
     let mut findings = detectors::run_wasm_detectors(&ir, cfg, &file_str);
     detectors::apply_severity_overrides(&mut findings, cfg);
-    findings.sort_by(|a, b| (&a.rule_id, &a.location.function).cmp(&(&b.rule_id, &b.location.function)));
+    findings.sort_by(|a, b| {
+        (&a.rule_id, &a.location.function).cmp(&(&b.rule_id, &b.location.function))
+    });
 
     let coeffs = soroban_common::CostCoefficients::default_coeffs();
     let report = budget::budget_module(&ir, &file_str, limits, coeffs);
@@ -80,10 +81,7 @@ pub fn analyze_module(
 }
 
 /// Analyze a Rust source file or directory tree.
-pub fn analyze_source(
-    path: &Path,
-    cfg: &RulesConfig,
-) -> Result<AnalysisOutput> {
+pub fn analyze_source(path: &Path, cfg: &RulesConfig) -> Result<AnalysisOutput> {
     let facts = source::scan_source_tree(path)?;
     let mut findings = detectors::run_source_detectors(&facts, cfg);
     detectors::apply_severity_overrides(&mut findings, cfg);

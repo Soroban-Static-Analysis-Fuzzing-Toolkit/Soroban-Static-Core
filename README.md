@@ -55,14 +55,26 @@ every `.wasm`/`.wat` file it contains.
 | Id | Severity | Kind | Detects |
 | --- | --- | --- | --- |
 | `SOR-101` | error | both | Entrypoint that performs state-changing operations without `require_auth`. |
-| `SOR-102` | error | both | Storage-type confusion (e.g. per-item data in instance storage). |
-| `SOR-103` | error | both | Token amounts flowing into unchecked arithmetic. |
-| `SOR-104` | error | both | Loops over storage-derived data without a static bound. |
+| `SOR-102` | error | source | Storage-type confusion (e.g. per-item data in instance storage). |
+| `SOR-103` | error | source | Token amounts flowing into unchecked arithmetic. |
+| `SOR-104` | error | source | Loops over storage-derived data without a static bound. |
 | `SOR-105` | warning | wasm | Estimated ledger reads approaching the 200-read ceiling. |
 | `SOR-106` | warning | wasm | `memory.grow` inside a loop risking the memory cap. |
 
 Detectors are conservative by design; each rule can be disabled or
 re-severitied per project.
+
+### Suppressing a finding
+
+In source mode a function can opt out of specific rules with an inline
+directive. This is preferred over disabling a rule project-wide:
+
+```rust
+pub fn pay(env: Env, amount: i128) {
+    // soroban-analyzer: allow(SOR-103)
+    let balance = amount + 10;
+}
+```
 
 ## Configuration
 
@@ -98,4 +110,24 @@ Wasm instruction counts are static estimates (`n_ops × coefficients`), summed
 over the call graph. Loop trip counts are unknowable statically, so the
 per-iteration cost is reported separately rather than folded into the total.
 Budget numbers answer "will a typical call fit?" — they are not consensus
-values.
+values. Verdicts are computed against the caps in
+[`common/src/limits.rs`](common/src/limits.rs) (reads, writes, memory pages,
+code size and CPU instructions), warning from 70% of any cap upward.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). CI runs `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`
+and the `probe` smoke test on every pull request, plus weekly to catch upstream
+`wasmparser` API drift.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)
+
+at your option.

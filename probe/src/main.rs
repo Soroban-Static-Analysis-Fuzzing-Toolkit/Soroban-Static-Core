@@ -5,7 +5,10 @@
 //! per-function operator iteration via `Operator` matching (the analyzer does
 //! not use the `VisitOperator` trait, whose methods dispatch individually).
 
-use wasmparser::{BinaryReaderError, ExternalKind, Imports, Operator, Parser, Payload, TypeRef, Validator, WasmFeatures};
+use wasmparser::{
+    BinaryReaderError, ExternalKind, Imports, Operator, Parser, Payload, TypeRef, Validator,
+    WasmFeatures,
+};
 
 #[derive(Default)]
 struct Counts {
@@ -103,7 +106,10 @@ fn main() -> Result<(), BinaryReaderError> {
                         }
                         Operator::Block { .. } => counts.blocks += 1,
                         Operator::Loop { .. } => counts.loops += 1,
-                        Operator::I64Add | Operator::I64Sub | Operator::I64Mul | Operator::I64DivU => {
+                        Operator::I64Add
+                        | Operator::I64Sub
+                        | Operator::I64Mul
+                        | Operator::I64DivU => {
                             counts.bins += 1;
                         }
                         _ => {}

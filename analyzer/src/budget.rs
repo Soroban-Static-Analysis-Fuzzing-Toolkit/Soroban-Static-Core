@@ -29,7 +29,8 @@ pub struct EntrypointBudget {
     pub est_writes: u64,
     /// Whether the call graph contains recursion.
     pub recursive: bool,
-    /// Estimated linear memory pages from the module memory section.
+    /// Estimated linear memory pages: the module's declared minimum plus one
+    /// page per `memory.grow` site in the entrypoint's body (a lower bound).
     pub memory_pages: Option<u32>,
     /// Verdict vs the configured limits.
     pub verdict: Verdict,
@@ -79,24 +80,36 @@ pub fn budget_module(
     limits: NetworkLimits,
     coeffs: CostCoefficients,
 ) -> BudgetReport {
-    // Memo table for per-function instruction estimates.
-    let mut memo: Vec<Option<u64>> = vec![None; ir.funcs.len()];
+    // Memo keyed by (function, call depth) and reset per entrypoint. A table
+    // shared across entrypoints let one entrypoint's depth-truncated estimate
+    // leak into another's, so results depended on iteration order.
+    let mut memo: Vec<Vec<Option<u64>>> = vec![vec![None; MAX_CALL_DEPTH + 1]; ir.funcs.len()];
 
     let mut entrypoints = Vec::new();
     for (idx, f) in ir.funcs.iter().enumerate() {
         if f.import.is_some() || f.exports.is_empty() {
             continue;
         }
+        for row in memo.iter_mut() {
+            row.fill(None);
+        }
         let est = estimate_ins(ir, idx, &mut memo, coeffs, 0);
         let reads = crate::detectors::count_reads_for_budget(ir, idx);
-        let writes = count_writes(ir, idx);
+        let writes = crate::detectors::count_writes_for_budget(ir, idx);
+        let memory_pages = memory_pages_with_growth(ir, f);
 
-        // Memory: declared pages plus growth sites give a lower bound.
-        let memory_pages = ir.memory_min_pages;
-
-        let verdict = if est >= u64::MAX / 2 || recursive_over_budget(f) {
+        let verdict = if instruction_over(est, &limits)
+            || at_or_over(reads, limits.max_reads)
+            || at_or_over(writes, limits.max_writes)
+            || memory_over(memory_pages, &limits)
+            || recursive_over_budget(f)
+        {
             Verdict::Over
-        } else if est_warn(est, reads, writes, &limits) {
+        } else if near_cap(est, limits.max_instructions)
+            || near_cap(reads, limits.max_reads)
+            || near_cap(writes, limits.max_writes)
+            || memory_near(memory_pages, &limits)
+        {
             Verdict::Warn
         } else {
             Verdict::Ok
@@ -124,23 +137,33 @@ pub fn budget_module(
         Verdict::Ok
     };
 
-    BudgetReport { file: file.to_string(), code_size: ir.code_size, code_size_verdict, entrypoints, limits }
+    BudgetReport {
+        file: file.to_string(),
+        code_size: ir.code_size,
+        code_size_verdict,
+        entrypoints,
+        limits,
+    }
 }
 
-/// Per-function instruction estimate with cycle-safe memoization.
+/// Call-graph depth at which the cycle guard truncates to body cost.
+///
+/// Recursion and mutual recursion make exact totals impossible statically; the
+/// guard bounds the estimate instead of diverging.
+const MAX_CALL_DEPTH: usize = 16;
+
+/// Per-function instruction estimate with cycle-safe, depth-keyed memoization.
 fn estimate_ins(
     ir: &ModuleIr,
     idx: usize,
-    memo: &mut Vec<Option<u64>>,
+    memo: &mut [Vec<Option<u64>>],
     c: CostCoefficients,
-    depth: u32,
+    depth: usize,
 ) -> u64 {
-    if depth > 16 {
-        // Cycle guard: recursion makes exact totals impossible statically;
-        // return the function's own body cost to bound the estimate.
+    if depth > MAX_CALL_DEPTH {
         return body_cost(ir, idx, c);
     }
-    if let Some(v) = memo[idx] {
+    if let Some(v) = memo[idx][depth] {
         return v;
     }
     let f = &ir.funcs[idx];
@@ -154,7 +177,7 @@ fn estimate_ins(
             total = total.saturating_add(cost);
         }
     }
-    memo[idx] = Some(total);
+    memo[idx][depth] = Some(total);
     total
 }
 
@@ -168,22 +191,11 @@ fn body_cost(ir: &ModuleIr, idx: usize, c: CostCoefficients) -> u64 {
     cost
 }
 
-/// Number of direct write-host call sites in a function.
-fn count_writes(ir: &ModuleIr, idx: usize) -> u64 {
-    const WRITE_HOST_FNS: &[&str] =
-        &["put_contract_data", "del_contract_data"];
-    let f = &ir.funcs[idx];
-    let mut total = 0u64;
-    for &c in &f.calls {
-        if let Some(t) = ir.funcs.get(c as usize) {
-            if let Some((_, name)) = &t.import {
-                if WRITE_HOST_FNS.iter().any(|s| name.contains(s)) {
-                    total += 1;
-                }
-            }
-        }
-    }
-    total
+/// Declared memory pages plus one page per growth site in the entrypoint's
+/// own body, as a lower bound on peak memory.
+fn memory_pages_with_growth(ir: &ModuleIr, f: &crate::wasm::FuncInfo) -> Option<u32> {
+    ir.memory_min_pages
+        .map(|declared| declared.saturating_add(f.memory_grow_sites))
 }
 
 /// Recursion alone does not imply over-budget; flag only unbounded growth via memory.
@@ -191,11 +203,29 @@ fn recursive_over_budget(f: &crate::wasm::FuncInfo) -> bool {
     f.recursive && f.memory_grow_sites > 0
 }
 
-/// ≥70% of any cap → warn.
-fn est_warn(est: u64, reads: u64, writes: u64, limits: &NetworkLimits) -> bool {
-    est >= 7_000_000
-        || reads * 10 >= limits.max_reads * 7
-        || writes * 10 >= limits.max_writes * 7
+/// Whether the instruction estimate is at or beyond the transaction cap.
+fn instruction_over(est: u64, limits: &NetworkLimits) -> bool {
+    at_or_over(est, limits.max_instructions)
+}
+
+/// Whether the memory estimate exceeds the memory cap.
+fn memory_over(pages: Option<u32>, limits: &NetworkLimits) -> bool {
+    pages.is_some_and(|p| p > limits.max_memory_pages)
+}
+
+/// Whether the memory estimate is within the 70% warning band.
+fn memory_near(pages: Option<u32>, limits: &NetworkLimits) -> bool {
+    pages.is_some_and(|p| near_cap(u64::from(p), u64::from(limits.max_memory_pages)))
+}
+
+/// Whether `value` is at or beyond `cap` (caps are inclusive ceilings).
+fn at_or_over(value: u64, cap: u64) -> bool {
+    cap > 0 && value >= cap
+}
+
+/// Whether `value` is at or beyond 70% of `cap`.
+fn near_cap(value: u64, cap: u64) -> bool {
+    cap > 0 && value.saturating_mul(10) >= cap.saturating_mul(7)
 }
 
 /// Format a one-line text summary of a budget report.
@@ -208,11 +238,12 @@ pub fn format_budget_report(report: &BudgetReport) -> String {
         report.code_size_verdict.as_str()
     ));
     s.push_str(&format!(
-        "  limits: reads<={} writes<={} memory_pages<={} code_size<={}\n",
+        "  limits: reads<={} writes<={} memory_pages<={} code_size<={} instructions<={}\n",
         report.limits.max_reads,
         report.limits.max_writes,
         report.limits.max_memory_pages,
-        report.limits.max_code_size
+        report.limits.max_code_size,
+        report.limits.max_instructions
     ));
     if report.entrypoints.is_empty() {
         s.push_str("  (no exported entrypoints found)\n");
@@ -230,4 +261,103 @@ pub fn format_budget_report(report: &BudgetReport) -> String {
         ));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wasm::parse_module;
+
+    fn budget(wat_src: &str) -> BudgetReport {
+        let bytes = wat::parse_str(wat_src).expect("wat parses");
+        let ir = parse_module(&bytes).expect("module parses");
+        budget_module(
+            &ir,
+            "test.wasm",
+            NetworkLimits::mainnet(),
+            CostCoefficients::default_coeffs(),
+        )
+    }
+
+    fn estimate_of(report: &BudgetReport, name: &str) -> u64 {
+        report
+            .entrypoints
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("entrypoint {name} not found"))
+            .est_instructions
+    }
+
+    /// A 21-link call chain in which every link calls a host import. `b` calls
+    /// the middle of the chain directly, so if one entrypoint's memo leaked
+    /// into another's, `b`'s estimate would change depending on whether `a`
+    /// was exported too.
+    fn chain_wat(export_a: bool) -> String {
+        let mut s = String::from(
+            "(module\n  (import \"l\" \"get_contract_data\" (func $host (param i32) (result i32)))\n",
+        );
+        s.push_str("  (func $f0 (param i32) (result i32)\n    local.get 0\n    call $host)\n");
+        for i in 1..=20 {
+            s.push_str(&format!(
+                "  (func $f{i} (param i32) (result i32)\n    local.get 0\n    call $f{}\n    i32.const 0\n    call $host\n    drop)\n",
+                i - 1
+            ));
+        }
+        if export_a {
+            s.push_str(
+                "  (func (export \"a\") (param i32) (result i32)\n    local.get 0\n    call $f20)\n",
+            );
+        }
+        s.push_str(
+            "  (func (export \"b\") (param i32) (result i32)\n    local.get 0\n    call $f10)\n)\n",
+        );
+        s
+    }
+
+    #[test]
+    fn entrypoint_estimates_do_not_depend_on_each_other() {
+        let with_a = budget(&chain_wat(true));
+        let without_a = budget(&chain_wat(false));
+        assert_eq!(
+            estimate_of(&with_a, "b"),
+            estimate_of(&without_a, "b"),
+            "b's estimate must not be poisoned by a's deeper traversal"
+        );
+    }
+
+    #[test]
+    fn budgets_are_repeatable() {
+        let first = budget(&chain_wat(true));
+        let second = budget(&chain_wat(true));
+        assert_eq!(first.entrypoints.len(), second.entrypoints.len());
+        for (a, b) in first.entrypoints.iter().zip(&second.entrypoints) {
+            assert_eq!(a.est_instructions, b.est_instructions);
+            assert_eq!(a.verdict, b.verdict);
+        }
+    }
+
+    #[test]
+    fn declared_memory_beyond_cap_is_over_budget() {
+        let report = budget(
+            r#"
+            (module
+              (memory 300)
+              (func (export "entry") (result i32)
+                i32.const 0))
+            "#,
+        );
+        assert_eq!(report.entrypoints[0].memory_pages, Some(300));
+        assert_eq!(report.entrypoints[0].verdict, Verdict::Over);
+    }
+
+    #[test]
+    fn thresholds_are_relative_to_the_configured_cap() {
+        assert!(at_or_over(100, 100));
+        assert!(!at_or_over(99, 100));
+        assert!(near_cap(70, 100));
+        assert!(!near_cap(69, 100));
+        // A zero cap disables the check instead of flagging everything.
+        assert!(!at_or_over(1, 0));
+        assert!(!near_cap(1, 0));
+    }
 }

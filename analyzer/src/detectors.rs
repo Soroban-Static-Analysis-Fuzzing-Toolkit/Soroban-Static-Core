@@ -1,9 +1,12 @@
 //! Detector engine: Soroban-specific vulnerability patterns.
 //!
-//! One detector per PR: add a `RuleMeta` entry to `RULES`, a check function,
-//! and wire it from `check_wasm`/`check_source`. Keep checks conservative —
+//! One detector per PR: add a `RuleMeta` entry to `all_rules()`, write a check
+//! function, and register it in `wasm_check`/`source_check`. The
+//! `every_registered_rule_is_wired` test fails when those get out of sync, so a
+//! rule can no longer be registered-but-never-run. Keep checks conservative —
 //! a detector that cries wolf gets disabled by users.
 
+use crate::rules::RulesConfig;
 use crate::source::SourceFacts;
 use crate::wasm::ModuleIr;
 use soroban_common::{Finding, Location, Severity};
@@ -34,6 +37,18 @@ pub enum RuleKind {
     Both,
 }
 
+impl RuleKind {
+    /// Whether this kind runs against a compiled wasm module.
+    pub fn runs_on_wasm(self) -> bool {
+        matches!(self, RuleKind::Wasm | RuleKind::Both)
+    }
+
+    /// Whether this kind runs against Rust source.
+    pub fn runs_on_source(self) -> bool {
+        matches!(self, RuleKind::Source | RuleKind::Both)
+    }
+}
+
 /// All registered detectors, in id order.
 pub fn all_rules() -> Vec<RuleMeta> {
     vec![
@@ -49,21 +64,24 @@ pub fn all_rules() -> Vec<RuleMeta> {
             name: "storage-type-confusion",
             description: "Persistent or instance storage used where temporary was expected (storage-type misuse)",
             default_severity: Severity::Error,
-            kind: RuleKind::Both,
+            // Source-only: the wasm front-end has no storage-type model yet.
+            kind: RuleKind::Source,
         },
         RuleMeta {
             id: "SOR-103",
             name: "unchecked-token-arithmetic",
             description: "Token amounts flow into arithmetic without overflow checks",
             default_severity: Severity::Error,
-            kind: RuleKind::Both,
+            // Source-only: needs amount-aware type information from Rust code.
+            kind: RuleKind::Source,
         },
         RuleMeta {
             id: "SOR-104",
             name: "unbounded-loop-over-storage",
             description: "Loop iterates over storage-derived data without a static bound",
             default_severity: Severity::Error,
-            kind: RuleKind::Both,
+            // Source-only: bound heuristics need source-level range expressions.
+            kind: RuleKind::Source,
         },
         RuleMeta {
             id: "SOR-105",
@@ -82,57 +100,95 @@ pub fn all_rules() -> Vec<RuleMeta> {
     ]
 }
 
+/// Signature of a wasm-mode detector.
+type WasmCheck = fn(&ModuleIr, &RuleMeta, &str) -> Vec<Finding>;
+
+/// Signature of a source-mode detector.
+type SourceCheck = fn(&SourceFacts, &RuleMeta) -> Vec<Finding>;
+
+/// The wasm-mode check for a rule id, if the rule has one.
+///
+/// Registration (`all_rules`) and dispatch live side by side so that adding a
+/// detector means adding one `RuleMeta` and one arm to each applicable table.
+/// The `every_registered_rule_is_wired` test fails if a rule is registered
+/// without a matching check, which used to be a silent no-op.
+fn wasm_check(rule_id: &str) -> Option<WasmCheck> {
+    Some(match rule_id {
+        "SOR-101" => sor_101_missing_require_auth,
+        "SOR-105" => sor_105_read_count_estimate,
+        "SOR-106" => sor_106_unbounded_memory,
+        _ => return None,
+    })
+}
+
+/// The source-mode check for a rule id, if the rule has one.
+fn source_check(rule_id: &str) -> Option<SourceCheck> {
+    Some(match rule_id {
+        "SOR-101" => sor_101_missing_require_auth_source,
+        "SOR-102" => sor_102_storage_confusion,
+        "SOR-103" => sor_103_unchecked_arith,
+        "SOR-104" => sor_104_unbounded_loop,
+        _ => return None,
+    })
+}
+
 /// Run all wasm detectors against a module.
-pub fn run_wasm_detectors(ir: &ModuleIr, cfg: &crate::rules::RulesConfig, file: &str) -> Vec<Finding> {
+pub fn run_wasm_detectors(ir: &ModuleIr, cfg: &RulesConfig, file: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for rule in all_rules() {
-        if !cfg.is_enabled(rule.id) {
+        if !cfg.is_enabled(rule.id) || !rule.kind.runs_on_wasm() {
             continue;
         }
-        let findings = match rule.kind {
-            RuleKind::Wasm | RuleKind::Both => match rule.id {
-                "SOR-101" => sor_101_missing_require_auth(ir, &rule, file),
-                "SOR-105" => sor_105_read_count_estimate(ir, &rule, file),
-                "SOR-106" => sor_106_unbounded_memory(ir, &rule, file),
-                _ => vec![],
-            },
-            RuleKind::Source => vec![],
-        };
-        out.extend(findings);
+        if let Some(check) = wasm_check(rule.id) {
+            out.extend(check(ir, &rule, file));
+        }
     }
     out
 }
 
 /// Run all source detectors against collected source facts.
-pub fn run_source_detectors(
-    facts: &SourceFacts,
-    cfg: &crate::rules::RulesConfig,
-) -> Vec<Finding> {
+///
+/// Findings allowed by an inline `soroban-analyzer: allow(...)` directive are
+/// dropped here, after the checks have run.
+pub fn run_source_detectors(facts: &SourceFacts, cfg: &RulesConfig) -> Vec<Finding> {
     let mut out = Vec::new();
     for rule in all_rules() {
-        if !cfg.is_enabled(rule.id) {
+        if !cfg.is_enabled(rule.id) || !rule.kind.runs_on_source() {
             continue;
         }
-        let findings = match rule.kind {
-            RuleKind::Source | RuleKind::Both => match rule.id {
-                "SOR-101" => sor_101_missing_require_auth_source(facts, &rule),
-                "SOR-102" => sor_102_storage_confusion(facts, &rule),
-                "SOR-103" => sor_103_unchecked_arith(facts, &rule),
-                "SOR-104" => sor_104_unbounded_loop(facts, &rule),
-                _ => vec![],
-            },
-            RuleKind::Wasm => vec![],
-        };
-        out.extend(findings);
+        if let Some(check) = source_check(rule.id) {
+            out.extend(check(facts, &rule));
+        }
     }
+    apply_inline_suppressions(&mut out, facts);
     out
 }
 
-/// Apply severity overrides from config.
-pub fn apply_severity_overrides(findings: &mut [Finding], cfg: &crate::rules::RulesConfig) {
+/// Drop findings whose `(file, function, rule_id)` is allowed by an inline
+/// directive written in the owning function.
+fn apply_inline_suppressions(findings: &mut Vec<Finding>, facts: &SourceFacts) {
+    findings.retain(|f| {
+        let Some(function) = f.location.function.as_deref() else {
+            return true;
+        };
+        !facts.functions.iter().any(|src| {
+            src.file == f.location.file
+                && src.name == function
+                && src.allowed_rules.iter().any(|r| r == &f.rule_id)
+        })
+    });
+}
+
+/// Apply explicit severity overrides from config.
+///
+/// Detectors pick their own severity — the rule default, or an intentional
+/// per-finding escalation such as SOR-105's error above the read ceiling. The
+/// config rewrites it only when the user configured that rule explicitly;
+/// unconditionally writing the default here would clobber that escalation.
+pub fn apply_severity_overrides(findings: &mut [Finding], cfg: &RulesConfig) {
     for f in findings.iter_mut() {
-        if let Some(rule) = all_rules().iter().find(|r| r.id == f.rule_id) {
-            f.severity = cfg.severity(f.rule_id.as_str(), rule.default_severity);
+        if let Some(severity) = cfg.explicit_severity(&f.rule_id) {
+            f.severity = severity;
         }
     }
 }
@@ -151,30 +207,25 @@ const STATE_CHANGING_HOST_FNS: &[&str] = &[
     "upload_wasm",
 ];
 
-fn sor_101_missing_require_auth(
-    ir: &ModuleIr,
-    rule: &RuleMeta,
-    file: &str,
-) -> Vec<Finding> {
+/// Host imports that establish authorization.
+///
+/// `require_auth_for_args` also contains this substring, so both host fns that
+/// can satisfy the check are covered.
+const REQUIRE_AUTH_HOST_FNS: &[&str] = &["require_auth"];
+
+fn sor_101_missing_require_auth(ir: &ModuleIr, rule: &RuleMeta, file: &str) -> Vec<Finding> {
     let mut out = Vec::new();
-    // For each defined function: which host fns does it (transitively) reach?
-    let n = ir.funcs.len();
-    let reach_host: Vec<bool> = (0..n)
-        .map(|i| reaches_host_state_change(ir, i))
-        .collect();
+    // Both sides of the rule use transitive reachability so that authorization
+    // delegated to a helper is recognised (the previous direct-call check
+    // produced false positives on the common delegation pattern).
+    let reach_host = reachable_imports(ir, STATE_CHANGING_HOST_FNS);
+    let reach_auth = reachable_imports(ir, REQUIRE_AUTH_HOST_FNS);
 
     for (idx, f) in ir.funcs.iter().enumerate() {
         if f.import.is_some() || f.exports.is_empty() {
             continue;
         }
-        let calls_require_auth = f.calls.iter().any(|&c| {
-            ir.funcs
-                .get(c as usize)
-                .and_then(|t| t.import.as_ref())
-                .map(|(_, n)| n.ends_with("require_auth"))
-                .unwrap_or(false)
-        });
-        if reach_host[idx] && !calls_require_auth {
+        if reach_host[idx] && !reach_auth[idx] {
             out.push(Finding {
                 rule_id: rule.id.to_string(),
                 message: format!(
@@ -197,30 +248,53 @@ fn sor_101_missing_require_auth(
     out
 }
 
-/// Does function `idx` transitively reach a state-changing host import?
-fn reaches_host_state_change(ir: &ModuleIr, idx: usize) -> bool {
+/// For every function, whether it transitively reaches an import whose name
+/// contains any of `needles`.
+///
+/// Computed with one reverse-reachability sweep instead of a fresh DFS per
+/// function, so a module with `n` functions and `e` call edges costs O(n + e)
+/// rather than O(n²).
+fn reachable_imports(ir: &ModuleIr, needles: &[&str]) -> Vec<bool> {
     let n = ir.funcs.len();
-    let mut seen = vec![false; n];
-    let mut stack = vec![idx as u32];
-    while let Some(cur) = stack.pop() {
-        let cu = cur as usize;
-        if seen[cu] {
+    // Reverse call edges: callers[t] lists the functions that call t.
+    let mut callers: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut reaches = vec![false; n];
+    let mut stack: Vec<u32> = Vec::new();
+
+    for (i, f) in ir.funcs.iter().enumerate() {
+        if f.import.is_some() {
             continue;
         }
-        seen[cu] = true;
-        if let Some((_, name)) = &ir.funcs[cu].import {
-            if STATE_CHANGING_HOST_FNS.iter().any(|s| name.contains(s)) {
-                return true;
+        for &c in &f.calls {
+            let ci = c as usize;
+            if ci >= n {
+                continue;
             }
-            continue;
-        }
-        for &c in &ir.funcs[cu].calls {
-            if (c as usize) < n && !seen[c as usize] {
-                stack.push(c);
+            callers[ci].push(i as u32);
+            let matches = ir.funcs[ci]
+                .import
+                .as_ref()
+                .is_some_and(|(_, name)| needles.iter().any(|needle| name.contains(needle)));
+            if matches {
+                stack.push(i as u32);
             }
         }
     }
-    false
+
+    // Propagate "reaches" backwards along call edges.
+    while let Some(cur) = stack.pop() {
+        let cu = cur as usize;
+        if reaches[cu] {
+            continue;
+        }
+        reaches[cu] = true;
+        for &caller in &callers[cu] {
+            if !reaches[caller as usize] {
+                stack.push(caller);
+            }
+        }
+    }
+    reaches
 }
 
 // ---------------------------------------------------------------------------
@@ -303,14 +377,14 @@ fn sor_101_missing_require_auth_source(facts: &SourceFacts, rule: &RuleMeta) -> 
 /// Host imports that perform ledger reads.
 const READ_HOST_FNS: &[&str] = &["get_contract_data", "has_contract_data"];
 
-/// Estimated reads per call of a read-performing host fn (conservative).
-const EST_READS_PER_CALL: u64 = 1;
+/// Host imports that perform ledger writes.
+const WRITE_HOST_FNS: &[&str] = &["put_contract_data", "del_contract_data"];
 
-fn sor_105_read_count_estimate(
-    ir: &ModuleIr,
-    rule: &RuleMeta,
-    file: &str,
-) -> Vec<Finding> {
+/// How many helper-call layers the budget counters inline. Kept shallow on
+/// purpose: deeper inlining would multiply counts we cannot bound statically.
+const HOST_INLINE_LEVELS: u32 = 1;
+
+fn sor_105_read_count_estimate(ir: &ModuleIr, rule: &RuleMeta, file: &str) -> Vec<Finding> {
     let limits = soroban_common::NetworkLimits::mainnet();
     let mut out = Vec::new();
 
@@ -318,7 +392,7 @@ fn sor_105_read_count_estimate(
         if f.import.is_some() || f.exports.is_empty() {
             continue;
         }
-        let base = count_direct_reads(ir, idx);
+        let base = count_host_calls(ir, idx, READ_HOST_FNS, HOST_INLINE_LEVELS);
         if base == 0 {
             continue;
         }
@@ -334,7 +408,9 @@ fn sor_105_read_count_estimate(
                     f.display_name(idx),
                     limits.max_reads
                 ),
-                help: Some("batch reads, cache in a single Map entry, or restructure storage keys".into()),
+                help: Some(
+                    "batch reads, cache in a single Map entry, or restructure storage keys".into(),
+                ),
                 severity: Severity::Error,
                 location: Location {
                     file: file.to_string(),
@@ -352,7 +428,9 @@ fn sor_105_read_count_estimate(
                     limits.max_reads
                 ),
                 help: None,
-                severity: Severity::Warning,
+                // Approaching, not exceeding, the ceiling: stays at the rule
+                // default unless the user re-severities it.
+                severity: rule.default_severity,
                 location: Location {
                     file: file.to_string(),
                     function: Some(f.display_name(idx)),
@@ -365,38 +443,45 @@ fn sor_105_read_count_estimate(
     out
 }
 
-/// Read-count estimate for budgeting: same heuristic the read-count detector
-/// uses, exposed for the budget module.
+/// Read-count estimate for budgeting: the same heuristic the read-count
+/// detector uses, exposed for the budget module.
 pub fn count_reads_for_budget(ir: &ModuleIr, idx: usize) -> u64 {
-    count_direct_reads(ir, idx)
+    count_host_calls(ir, idx, READ_HOST_FNS, HOST_INLINE_LEVELS)
 }
 
-/// Sum direct read-host call sites reachable within the function's own body
-/// plus one call level into helpers (kept shallow intentionally).
-fn count_direct_reads(ir: &ModuleIr, idx: usize) -> u64 {
-    let f = &ir.funcs[idx];
+/// Write-count estimate for budgeting.
+///
+/// Mirrors read counting (including one helper level) so writes delegated to a
+/// helper are not silently dropped from the budget.
+pub fn count_writes_for_budget(ir: &ModuleIr, idx: usize) -> u64 {
+    count_host_calls(ir, idx, WRITE_HOST_FNS, HOST_INLINE_LEVELS)
+}
+
+/// Count call sites in `idx` that reach a host import matching `needles`,
+/// inlining up to `levels` layers of helper calls.
+///
+/// This is call-site counting, not call-graph reachability: a helper invoked
+/// from an unbounded loop should not multiply a count we cannot bound
+/// statically.
+fn count_host_calls(ir: &ModuleIr, idx: usize, needles: &[&str], levels: u32) -> u64 {
+    let Some(f) = ir.funcs.get(idx) else {
+        return 0;
+    };
     let mut total = 0u64;
     for &c in &f.calls {
-        if let Some(t) = ir.funcs.get(c as usize) {
-            match &t.import {
-                Some((_, name)) => {
-                    if READ_HOST_FNS.iter().any(|s| name.contains(s)) {
-                        total += EST_READS_PER_CALL;
-                    }
-                }
-                None => {
-                    // One level of helper inlining.
-                    for &c2 in &t.calls {
-                        if let Some(t2) = ir.funcs.get(c2 as usize) {
-                            if let Some((_, n2)) = &t2.import {
-                                if READ_HOST_FNS.iter().any(|s| n2.contains(s)) {
-                                    total += EST_READS_PER_CALL;
-                                }
-                            }
-                        }
-                    }
+        let Some(target) = ir.funcs.get(c as usize) else {
+            continue;
+        };
+        match &target.import {
+            Some((_, name)) => {
+                if needles.iter().any(|needle| name.contains(needle)) {
+                    total += 1;
                 }
             }
+            None if levels > 0 => {
+                total += count_host_calls(ir, c as usize, needles, levels - 1);
+            }
+            None => {}
         }
     }
     total
@@ -406,11 +491,7 @@ fn count_direct_reads(ir: &ModuleIr, idx: usize) -> u64 {
 // SOR-106: unbounded memory growth
 // ---------------------------------------------------------------------------
 
-fn sor_106_unbounded_memory(
-    ir: &ModuleIr,
-    rule: &RuleMeta,
-    file: &str,
-) -> Vec<Finding> {
+fn sor_106_unbounded_memory(ir: &ModuleIr, rule: &RuleMeta, file: &str) -> Vec<Finding> {
     let mut out = Vec::new();
     for (idx, f) in ir.funcs.iter().enumerate() {
         if f.import.is_some() {
@@ -573,6 +654,126 @@ fn is_static_bound(hint: &str) -> bool {
     h.parse::<u64>().is_ok()
         || h == "CHUNK"
         || h == "MAX"
-        || h.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+        || h.chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wasm::parse_module;
+
+    fn module(wat_src: &str) -> ModuleIr {
+        let bytes = wat::parse_str(wat_src).expect("wat parses");
+        parse_module(&bytes).expect("module parses")
+    }
+
+    fn wasm_findings(wat_src: &str) -> Vec<Finding> {
+        let ir = module(wat_src);
+        run_wasm_detectors(&ir, &RulesConfig::default(), "test.wasm")
+    }
+
+    #[test]
+    fn every_registered_rule_is_wired() {
+        let mut seen: Vec<&str> = Vec::new();
+        for rule in all_rules() {
+            assert!(!seen.contains(&rule.id), "duplicate rule id {}", rule.id);
+            seen.push(rule.id);
+            if rule.kind.runs_on_wasm() {
+                assert!(
+                    wasm_check(rule.id).is_some(),
+                    "{} is registered for wasm but has no wasm check",
+                    rule.id
+                );
+            }
+            if rule.kind.runs_on_source() {
+                assert!(
+                    source_check(rule.id).is_some(),
+                    "{} is registered for source but has no source check",
+                    rule.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rule_ids_are_in_order() {
+        let ids: Vec<&str> = all_rules().iter().map(|r| r.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "all_rules() should list ids in order");
+    }
+
+    #[test]
+    fn sor_101_flags_entrypoint_without_auth() {
+        let findings = wasm_findings(
+            r#"
+            (module
+              (import "l" "put_contract_data" (func $put (param i32) (result i32)))
+              (func (export "entry") (param i32) (result i32)
+                local.get 0
+                call $put))
+            "#,
+        );
+        assert!(
+            findings.iter().any(|f| f.rule_id == "SOR-101"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn sor_101_accepts_auth_delegated_to_a_helper() {
+        // Regression: the entrypoint never calls require_auth directly, but a
+        // helper it calls does. The old direct-call check flagged this.
+        let findings = wasm_findings(
+            r#"
+            (module
+              (import "l" "put_contract_data" (func $put (param i32) (result i32)))
+              (import "l" "require_auth" (func $auth (param i32)))
+              (func $check (param i32)
+                local.get 0
+                call $auth)
+              (func $write (param i32) (result i32)
+                local.get 0
+                call $put)
+              (func (export "entry") (param i32) (result i32)
+                local.get 0
+                call $check
+                local.get 0
+                call $write))
+            "#,
+        );
+        assert!(
+            !findings.iter().any(|f| f.rule_id == "SOR-101"),
+            "delegated auth must not be flagged: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn budget_counters_include_delegated_host_calls() {
+        let ir = module(
+            r#"
+            (module
+              (import "l" "put_contract_data" (func $put (param i32) (result i32)))
+              (import "l" "get_contract_data" (func $get (param i32) (result i32)))
+              (func $write (param i32) (result i32)
+                local.get 0
+                call $put)
+              (func (export "entry") (param i32) (result i32)
+                local.get 0
+                call $write
+                drop
+                local.get 0
+                call $get))
+            "#,
+        );
+        let entry = ir
+            .funcs
+            .iter()
+            .position(|f| f.exports.iter().any(|e| e == "entry"))
+            .expect("entry exported");
+        assert_eq!(count_writes_for_budget(&ir, entry), 1);
+        assert_eq!(count_reads_for_budget(&ir, entry), 1);
+        assert_eq!(ir.funcs[entry].exports, vec!["entry"]);
+    }
+}

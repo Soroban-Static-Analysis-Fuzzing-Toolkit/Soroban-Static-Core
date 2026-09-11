@@ -66,7 +66,10 @@ pub struct ModuleIr {
 
 /// Parse and validate a wasm module, collecting the IR used by detectors.
 pub fn parse_module(wasm: &[u8]) -> Result<ModuleIr> {
-    let mut ir = ModuleIr { code_size: wasm.len() as u64, ..Default::default() };
+    let mut ir = ModuleIr {
+        code_size: wasm.len() as u64,
+        ..Default::default()
+    };
 
     // Full-module validation first; a hard error for malformed modules.
     let mut validator = Validator::new_with_features(WasmFeatures::all());
@@ -85,7 +88,13 @@ pub fn parse_module(wasm: &[u8]) -> Result<ModuleIr> {
                 for group in s {
                     match group? {
                         Imports::Single(_, imp) => {
-                            record_func_import(&mut ir, &mut n_imported, imp.module, imp.name, imp.ty);
+                            record_func_import(
+                                &mut ir,
+                                &mut n_imported,
+                                imp.module,
+                                imp.name,
+                                imp.ty,
+                            );
                         }
                         Imports::Compact1 { module, items } => {
                             for item in items {
@@ -120,7 +129,10 @@ pub fn parse_module(wasm: &[u8]) -> Result<ModuleIr> {
                 for exp in s {
                     let exp = exp?;
                     if matches!(exp.kind, ExternalKind::Func | ExternalKind::FuncExact) {
-                        exports_by_index.entry(exp.index).or_default().push(exp.name.to_string());
+                        exports_by_index
+                            .entry(exp.index)
+                            .or_default()
+                            .push(exp.name.to_string());
                     }
                 }
             }
@@ -139,7 +151,10 @@ pub fn parse_module(wasm: &[u8]) -> Result<ModuleIr> {
 
                 let mut info = FuncInfo {
                     import: None,
-                    exports: exports_by_index.get(&(abs_idx as u32)).cloned().unwrap_or_default(),
+                    exports: exports_by_index
+                        .get(&(abs_idx as u32))
+                        .cloned()
+                        .unwrap_or_default(),
                     body_offset: Some(body_offset),
                     n_locals: locals,
                     n_ops: 0,
@@ -213,7 +228,9 @@ fn record_func_import(
         return;
     }
     *n_imported += 1;
-    ir.host_call_counts.entry(format!("{module}.{name}")).or_insert(0);
+    ir.host_call_counts
+        .entry(format!("{module}.{name}"))
+        .or_insert(0);
     ir.funcs.push(FuncInfo {
         import: Some((module.to_string(), name.to_string())),
         exports: vec![],
@@ -229,31 +246,82 @@ fn record_func_import(
     });
 }
 
-/// Transitive-closure reachability to mark recursive functions.
+/// Mark functions that participate in a call cycle.
+///
+/// Uses Tarjan's strongly-connected-components algorithm (iteratively, so deep
+/// call graphs cannot blow the stack): a function is recursive when it is in an
+/// SCC of more than one node, or calls itself directly. This is O(n + e),
+/// replacing a per-function DFS that was O(n²).
 fn mark_recursion(ir: &mut ModuleIr) {
     let n = ir.funcs.len();
     let calls: Vec<Vec<u32>> = ir.funcs.iter().map(|f| f.calls.clone()).collect();
-    for i in 0..n {
-        let mut seen = vec![false; n];
-        let mut stack = vec![i as u32];
-        let mut reaches_self = false;
-        while let Some(cur) = stack.pop() {
-            let cu = cur as usize;
-            if seen[cu] {
+
+    let mut index: Vec<Option<u32>> = vec![None; n];
+    let mut low = vec![0u32; n];
+    let mut on_stack = vec![false; n];
+    let mut scc_stack: Vec<usize> = Vec::new();
+    // (node, next child position) — the explicit DFS stack.
+    let mut work: Vec<(usize, usize)> = Vec::new();
+    let mut next_index = 0u32;
+    let mut recursive = vec![false; n];
+
+    for root in 0..n {
+        if index[root].is_some() {
+            continue;
+        }
+        work.push((root, 0));
+        while !work.is_empty() {
+            let v = work.last().expect("non-empty").0;
+            if index[v].is_none() {
+                index[v] = Some(next_index);
+                low[v] = next_index;
+                next_index += 1;
+                scc_stack.push(v);
+                on_stack[v] = true;
+            }
+
+            let child_pos = work.last().expect("non-empty").1;
+            if child_pos < calls[v].len() {
+                work.last_mut().expect("non-empty").1 += 1;
+                let w = calls[v][child_pos] as usize;
+                if w >= n {
+                    continue;
+                }
+                if index[w].is_none() {
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w].expect("visited"));
+                }
                 continue;
             }
-            seen[cu] = true;
-            for &c in &calls[cu] {
-                let cc = c as usize;
-                if cc == i {
-                    reaches_self = true;
+
+            // All children of `v` are processed; close out this frame.
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if index[v] == Some(low[v]) {
+                let mut component = Vec::new();
+                loop {
+                    let w = scc_stack.pop().expect("component is non-empty");
+                    on_stack[w] = false;
+                    component.push(w);
+                    if w == v {
+                        break;
+                    }
                 }
-                if !seen[cc] {
-                    stack.push(c);
+                let self_loop = calls[v].contains(&(v as u32));
+                if component.len() > 1 || self_loop {
+                    for w in component {
+                        recursive[w] = true;
+                    }
                 }
             }
         }
-        ir.funcs[i].recursive = reaches_self;
+    }
+
+    for (i, f) in ir.funcs.iter_mut().enumerate() {
+        f.recursive = recursive[i];
     }
 }
 
@@ -283,8 +351,7 @@ fn compute_loop_costs(wasm: &[u8], ir: &mut ModuleIr) -> Result<()> {
                     // Both unconditional and conditional branches back to a
                     // loop header are backedges; compiled Rust loops almost
                     // always use `br_if`.
-                    Operator::Br { relative_depth }
-                    | Operator::BrIf { relative_depth } => {
+                    Operator::Br { relative_depth } | Operator::BrIf { relative_depth } => {
                         let target = depth.saturating_sub(*relative_depth + 1);
                         for (hdr_depth, backedges) in loop_meta.iter_mut().rev() {
                             if *hdr_depth == target {
@@ -327,7 +394,10 @@ fn compute_loop_costs(wasm: &[u8], ir: &mut ModuleIr) -> Result<()> {
 
 /// Whether an operator counts toward the static instruction estimate.
 fn is_counted(op: &Operator) -> bool {
-    !matches!(op, Operator::Block { .. } | Operator::Loop { .. } | Operator::If { .. })
+    !matches!(
+        op,
+        Operator::Block { .. } | Operator::Loop { .. } | Operator::If { .. }
+    )
 }
 
 #[cfg(test)]
@@ -385,5 +455,107 @@ mod tests {
         assert_eq!(ir.funcs[0].loops, 1);
         assert_eq!(ir.funcs[0].loop_backedges, 1);
         assert!(ir.funcs[0].ops_per_loop >= 5);
+    }
+
+    /// Deterministic xorshift64; enough for a fuzz smoke test without pulling
+    /// in a fuzzing dependency.
+    fn next_random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn detects_direct_and_mutual_recursion() {
+        let wasm = parse_str(
+            r#"
+            (module
+              (func $a (param i32) (result i32)
+                local.get 0
+                call $b)
+              (func $b (param i32) (result i32)
+                local.get 0
+                call $a)
+              (func $self (param i32) (result i32)
+                local.get 0
+                call $self)
+              (func (export "entry") (param i32) (result i32)
+                local.get 0
+                call $a))
+            "#,
+        )
+        .unwrap();
+        let ir = parse_module(&wasm).unwrap();
+        // $a and $b are mutually recursive; $self calls itself; the entry point
+        // is not part of any cycle.
+        assert_eq!(ir.funcs.iter().filter(|f| f.recursive).count(), 3);
+        let entry = ir
+            .funcs
+            .iter()
+            .find(|f| f.exports == vec!["entry"])
+            .expect("entry exported");
+        assert!(!entry.recursive);
+    }
+
+    #[test]
+    fn non_recursive_module_marks_nothing() {
+        let wasm = parse_str(
+            r#"
+            (module
+              (func $helper (param i32) (result i32)
+                local.get 0)
+              (func (export "entry") (param i32) (result i32)
+                local.get 0
+                call $helper))
+            "#,
+        )
+        .unwrap();
+        let ir = parse_module(&wasm).unwrap();
+        assert!(ir.funcs.iter().all(|f| !f.recursive));
+    }
+
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        // parse_module is run over untrusted third-party wasm; a panic would be
+        // a denial of service.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for len in 0..256usize {
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| (next_random(&mut state) & 0xff) as u8)
+                .collect();
+            let _ = parse_module(&bytes);
+        }
+    }
+
+    #[test]
+    fn corrupted_modules_never_panic() {
+        let valid = parse_str(
+            r#"
+            (module
+              (import "x" "f" (func $f (param i32)))
+              (memory 1)
+              (func (export "run") (param i32) (result i32)
+                local.get 0
+                call $f
+                i32.const 0
+                i32.const 0
+                memory.grow
+                drop
+                local.get 0))
+            "#,
+        )
+        .unwrap();
+
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..256 {
+            let mut bytes = valid.clone();
+            let flips = 1 + (next_random(&mut state) % 4) as usize;
+            for _ in 0..flips {
+                let idx = (next_random(&mut state) as usize) % bytes.len();
+                bytes[idx] ^= (next_random(&mut state) & 0xff) as u8;
+            }
+            let _ = parse_module(&bytes);
+        }
     }
 }

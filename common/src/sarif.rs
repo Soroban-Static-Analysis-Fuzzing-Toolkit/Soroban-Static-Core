@@ -12,6 +12,11 @@ pub struct SarifLog {
     runs: Vec<Run>,
 }
 
+/// Repository the tool's rules are documented in, used for SARIF
+/// `informationUri` so consumers link to a real page.
+const REPOSITORY_URL: &str =
+    "https://github.com/Soroban-Static-Analysis-Fuzzing-Toolkit/Soroban-Static-Core";
+
 /// A single analysis run within the log.
 #[derive(Debug, Serialize)]
 struct Run {
@@ -129,7 +134,9 @@ impl SarifLog {
                 rule_id: f.rule_id.clone(),
                 rule_index: rule_ids.iter().position(|id| id == &f.rule_id).unwrap_or(0),
                 level: level_for(f.severity),
-                message: Message { text: message_text(f) },
+                message: Message {
+                    text: message_text(f),
+                },
                 locations: vec![LocationSarif {
                     physical_location: PhysicalLocation {
                         artifact_location: ArtifactLocation {
@@ -152,7 +159,7 @@ impl SarifLog {
                     driver: Driver {
                         name: driver_name.into(),
                         version: Some(driver_version.into()),
-                        information_uri: "https://github.com/soroban-static-core".into(),
+                        information_uri: REPOSITORY_URL.into(),
                         rules,
                     },
                 },

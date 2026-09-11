@@ -11,8 +11,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 use soroban_analyzer::{
-    all_rules, analyze_module, analyze_source, format_budget_report, AnalysisOutput, InputMode,
-    RuleKind, RulesConfig, DEFAULT_CONFIG_TOML,
+    all_rules, analyze_module, analyze_source, format_budget_report, render_config_template,
+    AnalysisOutput, InputMode, RuleKind, RulesConfig,
 };
 use soroban_common::{sarif::SarifLog, Finding, NetworkLimits, Severity};
 use std::path::{Path, PathBuf};
@@ -121,7 +121,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if cli.init_config {
-        print!("{DEFAULT_CONFIG_TOML}");
+        print!("{}", render_config_template());
         return Ok(ExitCode::SUCCESS);
     }
     if cli.targets.is_empty() {
@@ -151,11 +151,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Format::Sarif => {
             let findings: Vec<&Finding> = outputs.iter().flat_map(|o| &o.findings).collect();
             let refs: Vec<Finding> = findings.into_iter().cloned().collect();
-            let log = SarifLog::from_findings(
-                "soroban-analyzer",
-                env!("CARGO_PKG_VERSION"),
-                &refs,
-            );
+            let log = SarifLog::from_findings("soroban-analyzer", env!("CARGO_PKG_VERSION"), &refs);
             println!("{}", log.to_json_pretty()?);
         }
     }
@@ -167,7 +163,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             .any(|f| f.severity >= threshold),
         None => false,
     };
-    Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
+    Ok(if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn load_config(path: Option<&Path>) -> Result<RulesConfig> {
@@ -189,6 +189,7 @@ fn collect_jobs(targets: &[PathBuf], mode: Mode) -> Result<Vec<(PathBuf, Mode)>>
         if !target.exists() {
             bail!("target not found: {}", target.display());
         }
+        validate_mode(target, mode)?;
         match resolve_mode(target, mode)? {
             // A wasm directory expands to every module it contains.
             resolved @ Mode::Wasm if target.is_dir() => {
@@ -208,6 +209,32 @@ fn collect_jobs(targets: &[PathBuf], mode: Mode) -> Result<Vec<(PathBuf, Mode)>>
         bail!("no targets to analyze");
     }
     Ok(jobs)
+}
+
+/// Reject an explicit `--mode` that cannot match the target.
+///
+/// Without this, `--mode source contract.wasm` reads the binary as UTF-8 text
+/// and reports "no findings" — a clean-looking result that silently analyzed
+/// nothing at all.
+fn validate_mode(path: &Path, mode: Mode) -> Result<()> {
+    if mode == Mode::Auto {
+        return Ok(());
+    }
+    let ext = path.extension().and_then(|e| e.to_str());
+    match (mode, ext, path.is_dir()) {
+        (Mode::Source, Some("wasm" | "wat"), false) => bail!(
+            "{} is a wasm module, not Rust source; drop --mode source",
+            path.display()
+        ),
+        (Mode::Wasm, Some("rs"), false) => bail!(
+            "{} is Rust source, not a wasm module; drop --mode wasm",
+            path.display()
+        ),
+        (Mode::Source, _, true) if !contains_ext(path, "rs") => {
+            bail!("no .rs files under {} (--mode source)", path.display())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Resolve `Auto` mode from the target's file extension or directory contents.
@@ -250,8 +277,8 @@ fn collect_files(root: &Path, exts: &[&str], out: &mut Vec<PathBuf>) -> Result<(
             if skip {
                 continue;
             }
-            for entry in std::fs::read_dir(&p)
-                .with_context(|| format!("read dir {}", p.display()))?
+            for entry in
+                std::fs::read_dir(&p).with_context(|| format!("read dir {}", p.display()))?
             {
                 stack.push(entry?.path());
             }

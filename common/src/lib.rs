@@ -66,6 +66,11 @@ pub struct Location {
 impl Location {
     /// Location pointing at a whole file.
     pub fn file(file: impl Into<String>) -> Self {
-        Self { file: file.into(), function: None, offset: None, line: None }
+        Self {
+            file: file.into(),
+            function: None,
+            offset: None,
+            line: None,
+        }
     }
 }

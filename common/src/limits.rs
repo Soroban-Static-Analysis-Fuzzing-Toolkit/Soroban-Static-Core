@@ -13,12 +13,27 @@ pub struct NetworkLimits {
     pub max_memory_pages: u32,
     /// Maximum wasm binary size in bytes for a deployed contract.
     pub max_code_size: u64,
+    /// Maximum CPU instructions per transaction.
+    ///
+    /// Mirrors the protocol's per-transaction CPU instruction cap, which is the
+    /// ceiling a single invocation cannot exceed. Budget estimates are compared
+    /// against this rather than an unstated constant.
+    pub max_instructions: u64,
 }
 
 impl NetworkLimits {
     /// Limits matching a currently realistic mainnet configuration.
+    ///
+    /// Values are protocol-level caps, not "comfortable" targets: the budget
+    /// reporter warns from 70% of any cap upward.
     pub const fn mainnet() -> Self {
-        Self { max_reads: 200, max_writes: 50, max_memory_pages: 256, max_code_size: 64 * 1024 }
+        Self {
+            max_reads: 200,
+            max_writes: 50,
+            max_memory_pages: 256,
+            max_code_size: 64 * 1024,
+            max_instructions: 100_000_000,
+        }
     }
 }
 
@@ -46,6 +61,13 @@ pub struct CostCoefficients {
 impl CostCoefficients {
     /// Conservative default coefficients.
     pub const fn default_coeffs() -> Self {
-        Self { default_ins: 1, call_ins: 8, call_indirect_ins: 40, host_call_ins: 200, mem_copy_per_64b: 4, mem_grow_per_page: 30_000 }
+        Self {
+            default_ins: 1,
+            call_ins: 8,
+            call_indirect_ins: 40,
+            host_call_ins: 200,
+            mem_copy_per_64b: 4,
+            mem_grow_per_page: 30_000,
+        }
     }
 }
