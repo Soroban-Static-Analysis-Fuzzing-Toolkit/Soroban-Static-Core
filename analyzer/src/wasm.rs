@@ -344,11 +344,11 @@ fn mark_recursion(ir: &mut ModuleIr) {
 fn compute_loop_costs(wasm: &[u8], ir: &mut ModuleIr) -> Result<()> {
     let mut per_fn_loop_ops: Vec<Vec<u64>> = Vec::new();
     let mut per_fn_loops: Vec<Vec<(u32, u32)>> = Vec::new(); // (header depth, backedges)
-    // Per-function vectors are indexed by defined-function ordinal. They are
-    // populated in the same streaming pass that visits `CodeSectionEntry`
-    // payloads, so their length must match `num_defined_funcs` at the end of
-    // the pass. The second pass below indexes them with
-    // `i - num_imported_funcs`, which is safe only for defined functions.
+                                                             // Per-function vectors are indexed by defined-function ordinal. They are
+                                                             // populated in the same streaming pass that visits `CodeSectionEntry`
+                                                             // payloads, so their length must match `num_defined_funcs` at the end of
+                                                             // the pass. The second pass below indexes them with
+                                                             // `i - num_imported_funcs`, which is safe only for defined functions.
 
     for payload in Parser::new(0).parse_all(wasm) {
         if let Payload::CodeSectionEntry(body) = payload? {
