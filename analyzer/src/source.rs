@@ -19,11 +19,27 @@
 
 use std::path::{Path, PathBuf};
 
+/// What a storage call does to the entry it touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageAccess {
+    /// `get`, `has`.
+    Read,
+    /// `set`, `remove`, `update`, `try_update`.
+    Write,
+    /// `extend_ttl`. Anyone can extend a TTL at the protocol level, so this is
+    /// not treated as a privileged state change.
+    ExtendTtl,
+    /// The method could not be found (e.g. the handle was bound to a variable).
+    Unknown,
+}
+
 /// One storage `(spec, key)` use site found in a function.
 #[derive(Debug, Clone)]
 pub struct StorageUse {
     /// Storage specifier, e.g. `Persistent`.
     pub spec: String,
+    /// Read, write or TTL extension.
+    pub access: StorageAccess,
     /// Source line (1-based).
     pub line: usize,
     /// Raw key expression text if captured (retained for future detectors).
@@ -47,6 +63,11 @@ pub struct SrcFn {
     pub name: String,
     /// File the function was found in.
     pub file: String,
+    /// Source line (1-based) of the function header.
+    pub line: usize,
+    /// Whether this is a `pub fn` directly inside a `#[contractimpl]` block,
+    /// i.e. a callable contract entrypoint.
+    pub is_entrypoint: bool,
     /// Called functions/methods (name fragments).
     pub calls: Vec<String>,
     /// Storage use sites.
@@ -69,8 +90,12 @@ pub struct SrcFn {
 /// All facts collected from a source tree.
 #[derive(Debug, Clone, Default)]
 pub struct SourceFacts {
-    /// Per-file, per-function facts.
+    /// Per-file, per-function facts. Test code (`#[cfg(test)]` modules,
+    /// `#[test]` functions, `test.rs`/`tests/` files) is excluded.
     pub functions: Vec<SrcFn>,
+    /// Whether any scanned file contains a `#[contractimpl]` block. When none
+    /// does, every public function is treated as a potential entrypoint.
+    pub has_contractimpl: bool,
     /// Any parse/scan warnings surfaced to the user (retained for future use).
     #[allow(dead_code)]
     pub warnings: Vec<String>,
@@ -101,26 +126,58 @@ pub fn scan_source_tree(root: &Path) -> anyhow::Result<SourceFacts> {
             continue;
         }
         if p.extension().map(|x| x == "rs").unwrap_or(false) {
-            scan_file(&p, &mut facts)?;
+            scan_file(&p, root, &mut facts)?;
         }
     }
     Ok(facts)
 }
 
+/// Kind of brace-delimited item that can contain functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Container {
+    /// `#[contractimpl] impl ...`
+    ContractImpl,
+    /// `#[cfg(test)] mod ...`
+    Test,
+    /// Any other `impl`, `mod` or `trait`.
+    Other,
+}
+
+/// Attributes seen on the lines preceding the next item.
+#[derive(Default)]
+struct PendingAttrs {
+    contractimpl: bool,
+    test: bool,
+}
+
+/// A function whose body is still being scanned.
+struct OpenFn {
+    facts: SrcFn,
+    /// File brace depth before the function header.
+    open_depth: i32,
+    body_started: bool,
+    /// Index of a storage use whose method is on a later line of the chain,
+    /// e.g. `env.storage()\n.persistent()\n.set(..)`.
+    pending_access: Option<usize>,
+}
+
 /// Scan one `.rs` file line by line, tracking the current function context.
 ///
-/// Function bodies are delimited by tracking brace depth from the opening
-/// brace, so a nested block that closes on its own line (`if`, `match`, `for`)
-/// no longer truncates the function and drops the facts that follow it.
-fn scan_file(path: &Path, facts: &mut SourceFacts) -> anyhow::Result<()> {
+/// Brace depth is tracked for the whole file so that functions are delimited
+/// correctly and each function knows which `impl`/`mod` it lives in. That is
+/// how entrypoints (`pub fn` in `#[contractimpl]`) are told apart from private
+/// helpers, and how test code is skipped.
+fn scan_file(path: &Path, root: &Path, facts: &mut SourceFacts) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
     let file_str = path.to_string_lossy().to_string();
-    let mut state = ScanState::default();
-    let mut current: Option<SrcFn> = None;
-    // Brace depth relative to the current function's opening brace.
+    let test_file = is_test_path(path.strip_prefix(root).unwrap_or(path));
+    let mut lexer = ScanState::default();
     let mut depth: i32 = 0;
-    let mut body_started = false;
+    let mut containers: Vec<(Container, i32)> = Vec::new();
+    let mut attrs = PendingAttrs::default();
+    let mut pending_container: Option<Container> = None;
+    let mut current: Option<OpenFn> = None;
 
     for (i, raw) in text.lines().enumerate() {
         let line_no = i + 1;
@@ -128,78 +185,173 @@ fn scan_file(path: &Path, facts: &mut SourceFacts) -> anyhow::Result<()> {
         // Suppression directives live in comments, so read the raw line first.
         if let Some(rules) = parse_allow_directive(raw) {
             if let Some(cur) = current.as_mut() {
-                cur.allowed_rules.extend(rules);
+                cur.facts.allowed_rules.extend(rules);
             }
         }
 
-        let line = state.strip(raw);
+        let line = lexer.strip(raw);
+        let trimmed = line.trim();
+        let (opens, closes) = brace_delta(&line);
 
-        // Start a function only when not already inside one.
-        if let Some(name) = fn_header(&line) {
-            if current.is_none() {
-                current = Some(SrcFn {
-                    name,
-                    file: file_str.clone(),
-                    ..Default::default()
-                });
-                let (opens, closes) = brace_delta(&line);
-                body_started = opens > 0;
-                depth = opens - closes;
-                // A single-line `fn f() {}` is complete on the header line.
-                if body_started && depth <= 0 {
-                    push_function(&mut current, facts);
-                    body_started = false;
-                }
+        if let Some(cur) = current.as_mut() {
+            collect_line_facts(&line, line_no, &mut cur.facts, &mut cur.pending_access);
+            depth += opens - closes;
+            cur.body_started |= opens > 0;
+            if cur.body_started && depth <= cur.open_depth {
+                finish(current.take(), facts);
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("#[") {
+            attrs.contractimpl |= trimmed.starts_with("#[contractimpl");
+            attrs.test |= trimmed.starts_with("#[test") || trimmed.starts_with("#[cfg(test");
+            if trimmed.starts_with("#[contractimpl") {
+                facts.has_contractimpl = true;
+            }
+            if trimmed.ends_with(']') {
                 continue;
             }
         }
 
-        let Some(cur) = current.as_mut() else {
-            continue;
-        };
-
-        collect_line_facts(&line, line_no, cur);
-
-        let (opens, closes) = brace_delta(&line);
-        if body_started {
+        if let Some(name) = fn_header(&line) {
+            let in_test =
+                test_file || attrs.test || containers.iter().any(|(k, _)| *k == Container::Test);
+            let in_contractimpl =
+                containers.last().map(|(k, _)| *k) == Some(Container::ContractImpl);
+            attrs = PendingAttrs::default();
+            let open = OpenFn {
+                facts: SrcFn {
+                    name,
+                    file: file_str.clone(),
+                    line: line_no,
+                    is_entrypoint: in_contractimpl && is_pub_item(trimmed),
+                    ..Default::default()
+                },
+                open_depth: depth,
+                body_started: opens > 0,
+                pending_access: None,
+            };
+            let mut open = open;
+            if in_test {
+                // Still track the body so its braces are consumed, but drop it.
+                open.facts.name.clear();
+            }
             depth += opens - closes;
-            if depth <= 0 {
-                push_function(&mut current, facts);
-                body_started = false;
+            current = Some(open);
+            let cur = current.as_mut().expect("just set");
+            if let Some(body) = line.find('{').map(|at| &line[at + 1..]) {
+                collect_line_facts(body, line_no, &mut cur.facts, &mut cur.pending_access);
             }
-        } else if opens > 0 {
-            // Header whose brace was on a later line.
-            body_started = true;
-            depth = opens - closes;
-            if depth <= 0 {
-                push_function(&mut current, facts);
-                body_started = false;
+            if cur.body_started && depth <= cur.open_depth {
+                finish(current.take(), facts);
+            } else if !cur.body_started && trimmed.ends_with(';') {
+                // Declaration without a body (trait method, extern fn).
+                current = None;
             }
+            continue;
+        }
+
+        if is_container_header(trimmed) {
+            pending_container = Some(if attrs.contractimpl {
+                Container::ContractImpl
+            } else if attrs.test {
+                Container::Test
+            } else {
+                Container::Other
+            });
+        }
+        if !trimmed.is_empty() {
+            attrs = PendingAttrs::default();
+        }
+        if opens > 0 {
+            if let Some(kind) = pending_container.take() {
+                containers.push((kind, depth));
+            }
+        } else if trimmed.ends_with(';') {
+            pending_container = None;
+        }
+        depth += opens - closes;
+        while containers.last().is_some_and(|(_, d)| depth <= *d) {
+            containers.pop();
         }
     }
-    if let Some(done) = current.take() {
-        facts.functions.push(done);
-    }
+    finish(current.take(), facts);
     Ok(())
 }
 
-/// Finish the in-progress function, if any.
-fn push_function(current: &mut Option<SrcFn>, facts: &mut SourceFacts) {
-    if let Some(done) = current.take() {
-        facts.functions.push(done);
+/// Store a finished function, unless it was test code (marked by an empty name).
+fn finish(done: Option<OpenFn>, facts: &mut SourceFacts) {
+    if let Some(done) = done {
+        if !done.facts.name.is_empty() {
+            facts.functions.push(done.facts);
+        }
     }
 }
 
+/// Whether a path (relative to the scan root) is test-only code by Rust
+/// convention: `test.rs`, `tests.rs`, `test_*.rs`, or anything under a
+/// `tests/` directory. Only the part below the root counts, so pointing the
+/// scanner at a `tests/` directory on purpose still scans it.
+fn is_test_path(path: &Path) -> bool {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    stem == "test"
+        || stem == "tests"
+        || stem.starts_with("test_")
+        || path
+            .parent()
+            .is_some_and(|p| p.components().any(|c| c.as_os_str() == "tests"))
+}
+
+/// Whether an item line starts with plain `pub` (not `pub(crate)` etc.).
+fn is_pub_item(line: &str) -> bool {
+    line.starts_with("pub ")
+}
+
+/// Whether a line opens an `impl`, `mod` or `trait` item.
+fn is_container_header(line: &str) -> bool {
+    let mut t = line;
+    if let Some(rest) = t.strip_prefix("pub(") {
+        t = rest.find(')').map_or("", |c| rest[c + 1..].trim_start());
+    } else if let Some(rest) = t.strip_prefix("pub ") {
+        t = rest.trim_start();
+    }
+    let t = t.strip_prefix("unsafe ").unwrap_or(t);
+    t.starts_with("impl ")
+        || t.starts_with("impl<")
+        || t.starts_with("mod ")
+        || t.starts_with("trait ")
+}
+
 /// Collect the Soroban idioms found on one cleaned source line.
-fn collect_line_facts(line: &str, line_no: usize, cur: &mut SrcFn) {
+fn collect_line_facts(
+    line: &str,
+    line_no: usize,
+    cur: &mut SrcFn,
+    pending_access: &mut Option<usize>,
+) {
     if line.contains("require_auth") {
         cur.has_require_auth = true;
         cur.calls.push("require_auth".into());
     }
+    // Resolve a storage chain whose method sits on a later line.
+    if let Some(idx) = *pending_access {
+        if let Some(access) = storage_access(line) {
+            cur.storage_literals[idx].access = access;
+            *pending_access = None;
+        } else if line.contains(';') {
+            *pending_access = None;
+        }
+    }
     if let Some(spec) = storage_spec_from_expr(line) {
         let key = capture_storage_key(line);
+        let access = storage_access(line);
+        if access.is_none() && !line.contains(';') {
+            *pending_access = Some(cur.storage_literals.len());
+        }
         cur.storage_literals.push(StorageUse {
             spec: spec.to_string(),
+            access: access.unwrap_or(StorageAccess::Unknown),
             line: line_no,
             key_text: key.clone(),
         });
@@ -453,6 +605,25 @@ fn storage_spec_from_expr(line: &str) -> Option<&'static str> {
     None
 }
 
+/// The storage method called on this line, if any.
+fn storage_access(line: &str) -> Option<StorageAccess> {
+    const METHODS: &[(&str, StorageAccess)] = &[
+        (".set(", StorageAccess::Write),
+        (".remove(", StorageAccess::Write),
+        (".update(", StorageAccess::Write),
+        (".try_update(", StorageAccess::Write),
+        (".extend_ttl(", StorageAccess::ExtendTtl),
+        (".get(", StorageAccess::Read),
+        (".get::<", StorageAccess::Read),
+        (".has(", StorageAccess::Read),
+    ];
+    METHODS
+        .iter()
+        .filter_map(|(pat, access)| line.find(pat).map(|at| (at, *access)))
+        .min_by_key(|(at, _)| *at)
+        .map(|(_, access)| access)
+}
+
 /// Record the bare names of functions/methods called on this line.
 ///
 /// Heuristic: any identifier immediately followed by `(`. Rust keywords are
@@ -678,6 +849,103 @@ mod tests {
             function(&facts, "entry").allowed_rules,
             vec!["SOR-101".to_string()]
         );
+    }
+
+    #[test]
+    fn storage_access_is_classified_across_chained_lines() {
+        let facts = scan(
+            r#"
+            fn helper(e: &Env, key: u32) -> i128 {
+                if let Some(v) = e.storage().persistent().get::<u32, i128>(&key) {
+                    e.storage()
+                        .persistent()
+                        .extend_ttl(&key, 100, 200);
+                    return v;
+                }
+                e.storage()
+                    .instance()
+                    .set(&key, &0);
+                0
+            }
+            "#,
+        );
+        let access: Vec<StorageAccess> = function(&facts, "helper")
+            .storage_literals
+            .iter()
+            .map(|s| s.access)
+            .collect();
+        assert_eq!(
+            access,
+            vec![
+                StorageAccess::Read,
+                StorageAccess::ExtendTtl,
+                StorageAccess::Write
+            ]
+        );
+    }
+
+    #[test]
+    fn entrypoints_are_pub_fns_in_contractimpl() {
+        let facts = scan(
+            r#"
+            #[contract]
+            pub struct C;
+
+            fn helper(env: &Env) {}
+
+            #[contractimpl]
+            impl C {
+                pub fn entry(env: Env) {
+                    helper(&env);
+                }
+                fn private_in_impl(env: Env) {}
+            }
+
+            impl C {
+                pub fn not_exported(env: Env) {}
+            }
+            "#,
+        );
+        assert!(facts.has_contractimpl);
+        assert!(function(&facts, "entry").is_entrypoint);
+        assert!(!function(&facts, "helper").is_entrypoint);
+        assert!(!function(&facts, "private_in_impl").is_entrypoint);
+        assert!(!function(&facts, "not_exported").is_entrypoint);
+    }
+
+    #[test]
+    fn test_code_is_skipped() {
+        let facts = scan(
+            r#"
+            pub fn real(env: Env) {}
+
+            #[cfg(test)]
+            mod tests {
+                fn in_test_mod(env: Env) {
+                    env.storage().persistent().set(&K, &1);
+                }
+            }
+
+            #[test]
+            fn standalone_test() {}
+
+            pub fn after(env: Env) {}
+            "#,
+        );
+        let names: Vec<&str> = facts.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["real", "after"]);
+    }
+
+    #[test]
+    fn test_files_are_skipped_below_the_scan_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("lib.rs"), "pub fn lib_fn(env: Env) {}\n").unwrap();
+        std::fs::write(dir.path().join("test.rs"), "fn t(env: Env) {}\n").unwrap();
+        let facts = scan_source_tree(dir.path()).expect("scan");
+        let names: Vec<&str> = facts.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["lib_fn"]);
+        assert!(!is_test_path(Path::new("src/lib.rs")));
+        assert!(is_test_path(Path::new("tests/integration.rs")));
     }
 
     /// Deterministic xorshift64; enough for a fuzz smoke test without pulling

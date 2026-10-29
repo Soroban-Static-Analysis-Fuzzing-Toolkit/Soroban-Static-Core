@@ -7,7 +7,7 @@
 //! a detector that cries wolf gets disabled by users.
 
 use crate::rules::RulesConfig;
-use crate::source::SourceFacts;
+use crate::source::{SourceFacts, StorageAccess};
 use crate::wasm::ModuleIr;
 use soroban_common::{Finding, Location, Severity};
 
@@ -312,74 +312,133 @@ fn reachable_imports(ir: &ModuleIr, needles: &[&str]) -> Vec<bool> {
 // ---------------------------------------------------------------------------
 // SOR-101 (source mode): missing require_auth in Rust source
 
-/// Source-mode counterpart of SOR-101. Flags contract functions that perform
-/// state-changing operations (storage writes, TTL bumps, token transfers)
-/// without calling require_auth.
+/// Source-mode counterpart of SOR-101. Flags contract entrypoints that change
+/// state (storage writes or token transfers) without any `require_auth` on
+/// the path.
+///
+/// Only `pub fn`s inside `#[contractimpl]` are checked: private helpers are
+/// called by entrypoints that do the auth check. Both auth and state changes
+/// are followed through local helper calls, so an entrypoint that delegates
+/// `require_auth` to a helper is accepted and one that writes through a helper
+/// is still caught. TTL extensions and reads are not state changes for this
+/// rule; anyone can extend a TTL at the protocol level. `__constructor` is
+/// skipped because it only runs at deployment.
 fn sor_101_missing_require_auth_source(facts: &SourceFacts, rule: &RuleMeta) -> Vec<Finding> {
+    let graph = SourceCallGraph::new(facts);
     let mut out = Vec::new();
-    for f in &facts.functions {
-        // Skip functions that already call require_auth.
-        if f.has_require_auth {
+    for (idx, f) in facts.functions.iter().enumerate() {
+        let is_candidate = if facts.has_contractimpl {
+            f.is_entrypoint
+        } else {
+            true
+        };
+        if !is_candidate || f.name == "__constructor" {
             continue;
         }
-        // Determine if this function performs state-changing operations.
-        let mut state_changing = false;
-        let mut change_description = String::new();
-
-        // Storage writes: .set() calls on Persistent, Temporary, or Instance.
-        for lit in &f.storage_literals {
-            if lit.spec == "Persistent" || lit.spec == "Temporary" || lit.spec == "Instance" {
-                state_changing = true;
-                if !change_description.is_empty() {
-                    change_description.push(';');
+        let reach = graph.reachable(idx);
+        if reach.iter().any(|&i| facts.functions[i].has_require_auth) {
+            continue;
+        }
+        let mut effects: Vec<String> = Vec::new();
+        for &i in &reach {
+            let g = &facts.functions[i];
+            let via = if i == idx {
+                String::new()
+            } else {
+                format!(" (via `{}`)", g.name)
+            };
+            for lit in &g.storage_literals {
+                if lit.access == StorageAccess::Write {
+                    effects.push(format!("{} storage write{via}", lit.spec.to_lowercase()));
                 }
-                change_description.push_str(&format!(" {} storage write", lit.spec.to_lowercase()));
+            }
+            if calls_transfer(g) {
+                effects.push(format!("token transfer{via}"));
             }
         }
-
-        // TTL bumps extend contract data lifetime (state-changing).
-        if !f.ttl_bump_lines.is_empty() {
-            state_changing = true;
-            if !change_description.is_empty() {
-                change_description.push(';');
-            }
-            change_description.push_str(" TTL extension");
+        effects.dedup();
+        let mut seen = std::collections::HashSet::new();
+        effects.retain(|e| seen.insert(e.clone()));
+        if effects.is_empty() {
+            continue;
         }
-
-        // Token transfers change account balances.
-        let does_transfer = f.calls.iter().any(|c| {
-            let c = c.as_str();
-            c == "transfer" || c.ends_with("::transfer") || c.ends_with("transfer(")
+        out.push(Finding {
+            rule_id: rule.id.to_string(),
+            message: format!(
+                "entrypoint `{}` performs {} but never calls require_auth",
+                f.name,
+                effects.join(", ")
+            ),
+            help: Some(
+                "add require_auth() for the account that authorizes this action, or allow(SOR-101) if it is meant to be permissionless".into(),
+            ),
+            severity: rule.default_severity,
+            location: Location {
+                file: f.file.clone(),
+                function: Some(f.name.clone()),
+                offset: None,
+                line: Some(f.line as u64),
+            },
         });
-        if does_transfer {
-            state_changing = true;
-            if !change_description.is_empty() {
-                change_description.push(';');
-            }
-            change_description.push_str(" token transfer");
-        }
-
-        if state_changing {
-            out.push(Finding {
-                rule_id: rule.id.to_string(),
-                message: format!(
-                    "function `{}` performs{change_description} but never calls require_auth",
-                    f.name
-                ),
-                help: Some(
-                    "add env.require_auth() for each account/contract authorized to perform this action".into(),
-                ),
-                severity: rule.default_severity,
-                location: Location {
-                    file: f.file.clone(),
-                    function: Some(f.name.clone()),
-                    offset: None,
-                    line: None,
-                },
-            });
-        }
     }
     out
+}
+
+/// Whether a function calls a token `transfer`/`transfer_from`.
+fn calls_transfer(f: &crate::source::SrcFn) -> bool {
+    f.calls
+        .iter()
+        .any(|c| c == "transfer" || c == "transfer_from")
+}
+
+/// Calls between scanned functions, resolved by name.
+struct SourceCallGraph {
+    edges: Vec<Vec<usize>>,
+}
+
+impl SourceCallGraph {
+    fn new(facts: &SourceFacts) -> Self {
+        let mut by_name: std::collections::HashMap<&str, Vec<usize>> = Default::default();
+        for (i, f) in facts.functions.iter().enumerate() {
+            by_name.entry(f.name.as_str()).or_default().push(i);
+        }
+        let edges = facts
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let mut targets: Vec<usize> = f
+                    .calls
+                    .iter()
+                    // A token client's `transfer` is not a call into this contract.
+                    .filter(|c| c.as_str() != "transfer" && c.as_str() != "transfer_from")
+                    .filter_map(|c| by_name.get(c.as_str()))
+                    .flatten()
+                    .copied()
+                    .filter(|&t| t != i)
+                    .collect();
+                targets.sort_unstable();
+                targets.dedup();
+                targets
+            })
+            .collect();
+        Self { edges }
+    }
+
+    /// `start` and every function reachable from it, in visit order.
+    fn reachable(&self, start: usize) -> Vec<usize> {
+        let mut seen = vec![false; self.edges.len()];
+        let mut order = Vec::new();
+        let mut stack = vec![start];
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut seen[i], true) {
+                continue;
+            }
+            order.push(i);
+            stack.extend(self.edges[i].iter().rev());
+        }
+        order
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -798,6 +857,98 @@ mod tests {
             !findings.iter().any(|f| f.rule_id == "SOR-101"),
             "delegated auth must not be flagged: {findings:?}"
         );
+    }
+
+    fn source_findings(src: &str) -> Vec<Finding> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("lib.rs"), src).expect("write");
+        let facts = crate::source::scan_source_tree(dir.path()).expect("scan");
+        let rule = all_rules()
+            .into_iter()
+            .find(|r| r.id == "SOR-101")
+            .expect("SOR-101 registered");
+        sor_101_missing_require_auth_source(&facts, &rule)
+    }
+
+    /// Shape of the soroban-examples token contract: getters read and bump
+    /// TTLs, helpers write, and entrypoints authorize before calling helpers.
+    const TOKEN_LIKE: &str = r#"
+        fn read_balance(e: &Env, addr: Address) -> i128 {
+            if let Some(b) = e.storage().persistent().get::<DataKey, i128>(&addr) {
+                e.storage()
+                    .persistent()
+                    .extend_ttl(&addr, 1, 2);
+                b
+            } else {
+                0
+            }
+        }
+        fn write_balance(e: &Env, addr: Address, amount: i128) {
+            e.storage().persistent().set(&addr, &amount);
+        }
+        fn check_admin(e: &Env) {
+            let admin: Address = e.storage().instance().get(&KEY).unwrap();
+            admin.require_auth();
+        }
+
+        #[contractimpl]
+        impl Token {
+            pub fn __constructor(e: Env, admin: Address) {
+                e.storage().instance().set(&KEY, &admin);
+            }
+            pub fn balance(e: Env, id: Address) -> i128 {
+                e.storage().instance().extend_ttl(1, 2);
+                read_balance(&e, id)
+            }
+            pub fn transfer(e: Env, from: Address, to: Address, amount: i128) {
+                from.require_auth();
+                write_balance(&e, from, amount);
+            }
+            pub fn mint(e: Env, to: Address, amount: i128) {
+                check_admin(&e);
+                write_balance(&e, to, amount);
+            }
+            pub fn burn_unchecked(e: Env, from: Address, amount: i128) {
+                write_balance(&e, from, amount);
+            }
+        }
+
+        #[cfg(test)]
+        mod test {
+            fn test_transfer(e: Env) {
+                token.transfer(&a, &b, &1);
+            }
+        }
+    "#;
+
+    #[test]
+    fn sor_101_source_only_flags_unauthorized_entrypoints() {
+        let findings = source_findings(TOKEN_LIKE);
+        let flagged: Vec<&str> = findings
+            .iter()
+            .filter_map(|f| f.location.function.as_deref())
+            .collect();
+        // Reads, TTL bumps, the constructor, private helpers, delegated auth
+        // and test code must not be reported; the write through a helper must.
+        assert_eq!(flagged, vec!["burn_unchecked"], "{findings:?}");
+        assert!(
+            findings[0].message.contains("via `write_balance`"),
+            "{}",
+            findings[0].message
+        );
+        assert!(findings[0].location.line.is_some());
+    }
+
+    #[test]
+    fn sor_101_source_without_contractimpl_checks_every_function() {
+        let findings = source_findings(
+            r#"
+            pub fn store(env: Env) {
+                env.storage().persistent().set(&K, &1);
+            }
+            "#,
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
     }
 
     #[test]

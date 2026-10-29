@@ -130,6 +130,13 @@ HIR/MIR pipeline. It recognizes common Soroban SDK idioms (storage literals,
 source-mode detectors, and it is deliberately conservative: when a heuristic
 cannot be sure, it prefers a lower severity or no finding.
 
+It tracks which `impl`/`mod` each function belongs to, so SOR-101 checks only
+contract entrypoints (`pub fn` in `#[contractimpl]`) and follows calls into
+local helpers. Storage calls are classified as reads, writes or TTL
+extensions, and test code (`test.rs`, `tests/`, `#[cfg(test)]`, `#[test]`) is
+skipped. See [docs/validation.md](docs/validation.md) for results against the
+official `soroban-examples` contracts.
+
 Because it works line-by-line over cleaned source text, it can miss patterns
 that depend on type information, macros, or non-trivial control flow, and it
 can occasionally match idioms inside comments or string literals if the
